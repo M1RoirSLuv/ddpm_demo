@@ -1,0 +1,18 @@
+experiment_name: "thermal_ddpm_base"
+data:
+  dataset_path: "./data/raw"  # 修改为你存放10K张红外图片的实际路径
+  image_size: 64              # 初学者建议64，显存大可改128
+  channels: 1                 # 红外单通道
+  sample_limit: 10000         # 限制读取数量
+
+model:
+  model_channels: 64          # 基础通道
+  channel_mult: [1, 2, 4, 8]  # 通道倍增
+  num_res_blocks: 2           # 残差块数量
+
+training:
+  batch_size: 64
+  num_epochs: 50
+  learning_rate: 0.0001
+  save_interval: 5            # 每5个epoch保存一次
+  device: "cuda"

@@ -5,10 +5,8 @@ from diffusers import UNet2DModel, DDPMScheduler
 from accelerate import Accelerator
 import os
 from tqdm import tqdm
-import argparse
+import argparse # 用于接收权重路径
 
-
-# 1. 定义潜空间数据集
 class LatentDataset(Dataset):
     def __init__(self, latent_dir):
         self.files = [os.path.join(latent_dir, f) for f in os.listdir(latent_dir) if f.endswith('.pt')]
@@ -22,34 +20,28 @@ class LatentDataset(Dataset):
     def __getitem__(self, idx):
         return torch.load(self.files[idx])
 
-
-# 2. 训练主函数
 def train():
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("--resume", type=str, default=None, help="权重的路径，例如 ./checkpoints/unet_epoch_10.pth")
+    parser.add_argument("--resume", type=str, default="./checkpoints/unet_epoch_10.pth")
     args = parser.parse_args()
 
     # --- 超参数设置 ---
     LATENT_DIR = "./data/latents"
     OUTPUT_DIR = "./checkpoints"
-    BATCH_SIZE = 2
-    GRADIENT_ACCUM = 4
+    BATCH_SIZE = 2 
+    GRADIENT_ACCUM = 4 
     LEARNING_RATE = 1e-4
-    EPOCHS = 100
+    EPOCHS = 50  # 
     # ------------------
 
-    # 初始化加速器
     accelerator = Accelerator(
         mixed_precision="fp16",
         gradient_accumulation_steps=GRADIENT_ACCUM
     )
 
-    # 数据加载
     dataset = LatentDataset(LATENT_DIR)
     train_dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    # 初始化 UNet
     model = UNet2DModel(
         sample_size=(256, 320),
         in_channels=3,
@@ -63,32 +55,23 @@ def train():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
 
-    # --- 关键修改：加载旧权重 ---
+    # 加载第 10 轮的权重并设置起始位置
     start_epoch = 0
-    if args.resume:
-        print(f"正在加载权重: {args.resume}")
-        # 加载权重到 CPU (由 accelerator 自动移到 GPU)
+    if os.path.exists(args.resume):
+        print(f"正在从 {args.resume} 恢复训练...")
         checkpoint = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(checkpoint)
+        start_epoch = 11  # 因为 10 已经跑完了，所以从 11 开始
+        print(f"起始点已设为 Epoch {start_epoch}")
+    else:
+        print(f"未找到权重文件 {args.resume}，将从零开始训练！")
 
-        # 自动计算开始的轮数
-        # 假设文件名是 unet_epoch_10.pth，说明 0-10 跑完了，下次从 11 开始
-        try:
-            # 解析文件名里的数字
-            file_epoch_num = int(args.resume.split("_")[-1].split(".")[0])
-            start_epoch = file_epoch_num + 1
-            print(f"上次保存的是 Epoch {file_epoch_num}，将从 Epoch {start_epoch} 继续训练！")
-        except:
-            print("⚠️ 无法从文件名解析 Epoch，将从 0 开始计数（但权重已加载）。")
-
-    # 使用 accelerator 准备所有组件
     model, optimizer, train_dataloader = accelerator.prepare(model, optimizer, train_dataloader)
-
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print(f"开始训练 (目标: {EPOCHS} Epochs)...")
-
-    # --- 修改循环范围：从 start_epoch 到 100 ---
+    print(f"开始训练 (从 {start_epoch} 到 {EPOCHS})...")
+    
+    # 修改循环范围：range(11, 50)
     for epoch in range(start_epoch, EPOCHS):
         model.train()
         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
@@ -99,13 +82,11 @@ def train():
                 clean_latents = batch
                 noise = torch.randn_like(clean_latents)
                 bs = clean_latents.shape[0]
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,),
-                                          device=clean_latents.device).long()
-
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_latents.device).long()
                 noisy_latents = noise_scheduler.add_noise(clean_latents, noise, timesteps)
                 noise_pred = model(noisy_latents, timesteps).sample
                 loss = F.mse_loss(noise_pred, noise)
-
+                
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -113,15 +94,14 @@ def train():
             progress_bar.update(1)
             progress_bar.set_postfix(loss=loss.item())
 
-        # 定期保存
-        if epoch % 10 == 0:
+        # 每 10 轮保存一次，50 结束时也会保存
+        if epoch % 10 == 0 or epoch == EPOCHS - 1:
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 unwrapped_model = accelerator.unwrap_model(model)
                 save_path = os.path.join(OUTPUT_DIR, f"unet_epoch_{epoch}.pth")
                 torch.save(unwrapped_model.state_dict(), save_path)
-                print(f"已保存: {save_path}")
-
+                print(f"已保存最新权重: {save_path}")
 
 if __name__ == "__main__":
     train()

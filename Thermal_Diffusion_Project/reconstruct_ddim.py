@@ -44,8 +44,18 @@ def run_ddim_reconstruction():
 
     # 5. VAE 编码并缩放
     with torch.no_grad():
-        latents = vae.encode(img_tensor).mode() * SCALING_FACTOR
-    
+        encoder_output = vae.encode(img_tensor)
+        if isinstance(encoder_output, tuple):
+    # 如果是 VQModel，返回 (latent, loss, info)，取第一个
+            latents = encoder_output[0]
+        elif hasattr(encoder_output, 'mode'):
+    # 如果是 KL-VAE 且有 mode() 方法
+            latents = encoder_output.mode()
+        else:
+    # 备选方案
+            latents = encoder_output
+
+    latents = latents * SCALING_FACTOR
     latents = latents.to(DEVICE)
     
     # --- DDIM Inversion (将图片转为确定性噪声) ---

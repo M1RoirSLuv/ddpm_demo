@@ -1,16 +1,15 @@
 import torch
 import os
-import cv2
 import numpy as np
 from torchvision import transforms
-from pytorch_msssim import ssim
+from skimage.metrics import structural_similarity as ssim
 from PIL import Image
-from model import UNet   
+from model import UNet
 
 device = "cuda"
 
-model_path = "ddpm_model.pt"
-data_dir = "data_256"           
+model_path = "./ddpm_ckpt/ddpm_epoch_99.pt"
+data_dir = "./data/raw_256"           
 save_dir = "recon_results"
 os.makedirs(save_dir, exist_ok=True)
 
@@ -63,6 +62,13 @@ def reconstruct(x0):
 # ===== evaluation =====
 ssim_scores = []
 
+def compute_ssim(x_rec, x_gt):
+    rec = x_rec.squeeze().detach().cpu().numpy()
+    gt = x_gt.squeeze().detach().cpu().numpy()
+
+    score = ssim(gt, rec, data_image=1.0)
+    return score
+
 for name in os.listdir(data_dir):
     path = os.path.join(data_dir, name)
 
@@ -75,16 +81,20 @@ for name in os.listdir(data_dir):
     # 反归一化
     x0_img = (x0 * 0.5 + 0.5).clamp(0,1)
     x_rec_img = (x_rec * 0.5 + 0.5).clamp(0,1)
+    print(type(x0_img))
+    print(type(x_rec_img))
 
-    score = ssim(x_rec_img, x0_img, data_range=1.0).item()
+    rec_np = x_rec_img.squeeze().detach().cpu().numpy()
+    gt_np = x0_img.squeeze().detach().cpu().numpy
+
+    score = ssim(gt_np, rec_np, data_range = 1.0)
     ssim_scores.append(score)
 
     # ===== 保存重建图 =====
-    out = x_rec_img.squeeze().cpu().numpy() * 255
-    out = out.astype(np.uint8)
+    out = (x_rec_img.squeeze().cpu().numpy() * 255).astype("uint8")
 
     save_path = os.path.join(save_dir, name)
-    cv2.imwrite(save_path, out)
+    Image.fromarray(out).save(save_path)
 
     print(f"{name} SSIM={score:.4f}")
 

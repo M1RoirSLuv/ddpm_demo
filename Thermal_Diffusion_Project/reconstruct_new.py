@@ -34,30 +34,32 @@ transform = transforms.Compose([
     transforms.Normalize([0.5], [0.5])
 ])
 
-def reconstruct(x0):
-    """从图像 → 加噪 → DDPM反推"""
-    x = x0.clone()
+def reconstruct(x0, t_start=200):
+    noise = torch.randn_like(x0)
 
-    # 正向加噪到T
-    for t in range(T):
-        noise = torch.randn_like(x)
-        x = torch.sqrt(alpha[t]) * x + torch.sqrt(beta[t]) * noise
+    xt = (
+        torch.sqrt(alphas_cumprod[t_start]) * x0 +
+        torch.sqrt(1 - alphas_cumprod[t_start]) * noise
+    )
 
-    # 反向采样
-    for t in reversed(range(T)):
-        t_tensor = torch.tensor([t], device=device)
-        noise_pred = model(x, t_tensor)
+    x = xt
+    for i in reversed(range(t_start)):
+        t = torch.tensor([i], device=device).float()
+        pred_noise = model(x, t)
 
-        if t > 0:
-            noise = torch.randn_like(x)
-        else:
-            noise = 0
+        alpha = alphas[i]
+        alpha_bar = alphas_cumprod[i]
+        beta = betas[i]
 
-        x = (1 / torch.sqrt(alpha[t])) * (
-            x - (beta[t] / torch.sqrt(1 - alpha_bar[t])) * noise_pred
-        ) + torch.sqrt(beta[t]) * noise
+        x = (1 / torch.sqrt(alpha)) * (
+            x - (beta / torch.sqrt(1 - alpha_bar)) * pred_noise
+        )
+
+        if i > 0:
+            x += torch.sqrt(beta) * torch.randn_like(x)
 
     return x
+
 
 # ===== evaluation =====
 ssim_scores = []
@@ -85,7 +87,7 @@ for name in os.listdir(data_dir):
     print(type(x_rec_img))
 
     rec_np = x_rec_img.squeeze().detach().cpu().numpy()
-    gt_np = x0_img.squeeze().detach().cpu().numpy
+    gt_np = x0_img.squeeze().detach().cpu().numpy()
 
     score = ssim(gt_np, rec_np, data_range = 1.0)
     ssim_scores.append(score)

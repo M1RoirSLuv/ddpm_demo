@@ -1,106 +1,93 @@
 import torch
-import torch.nn.functional as F
-from torchvision import transforms
-from torch.utils.data import DataLoader, Dataset
-from PIL import Image
 import os
-from skimage.metrics import structural_similarity as ssim
+import cv2
 import numpy as np
+from torchvision import transforms
+from pytorch_msssim import ssim
+from PIL import Image
+from model import UNet   
 
-# =====================
-# 配置
-# =====================
-
-model_path = "./ddpm_ckpt/ddpm_epoch_99.pt"
-data_dir = "./ir_256"
 device = "cuda"
-image_size = 256
+
+model_path = "ddpm_model.pt"
+data_dir = "data_256"           
+save_dir = "recon_results"
+os.makedirs(save_dir, exist_ok=True)
+
+img_size = 256
 T = 1000
 
-# =====================
-# 数据集
-# =====================
-
-class IRDataset(Dataset):
-    def __init__(self, folder):
-        self.paths = [os.path.join(folder, f) for f in os.listdir(folder)]
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])
-        ])
-
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, i):
-        img = Image.open(self.paths[i]).convert("L")
-        return self.transform(img), self.paths[i]
-
-loader = DataLoader(IRDataset(data_dir), batch_size=1)
-
-# =====================
-# 加载模型（使用你的UNet）
-# =====================
-
+# ===== load model =====
 model = UNet().to(device)
 model.load_state_dict(torch.load(model_path, map_location=device))
 model.eval()
 
-# =====================
-# 扩散参数（必须与训练一致）
-# =====================
+# ===== diffusion schedule =====
+beta = torch.linspace(1e-4, 0.02, T).to(device)
+alpha = 1 - beta
+alpha_bar = torch.cumprod(alpha, dim=0)
 
-betas = torch.linspace(1e-4, 0.02, T).to(device)
-alphas = 1 - betas
-alphas_cumprod = torch.cumprod(alphas, dim=0)
+# ===== transform =====
+transform = transforms.Compose([
+    transforms.Grayscale(),
+    transforms.Resize((img_size, img_size)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5], [0.5])
+])
 
-# =====================
-# 单图重建
-# =====================
+def reconstruct(x0):
+    """从图像 → 加噪 → DDPM反推"""
+    x = x0.clone()
 
-def reconstruct(x0, t_start=300):
-    noise = torch.randn_like(x0)
-    xt = (
-        torch.sqrt(alphas_cumprod[t_start]) * x0 +
-        torch.sqrt(1 - alphas_cumprod[t_start]) * noise
-    )
+    # 正向加噪到T
+    for t in range(T):
+        noise = torch.randn_like(x)
+        x = torch.sqrt(alpha[t]) * x + torch.sqrt(beta[t]) * noise
 
-    x = xt
-    for i in reversed(range(t_start)):
-        t = torch.tensor([i], device=device).float()
-        pred_noise = model(x, t)
+    # 反向采样
+    for t in reversed(range(T)):
+        t_tensor = torch.tensor([t], device=device)
+        noise_pred = model(x, t_tensor)
 
-        alpha = alphas[i]
-        alpha_bar = alphas_cumprod[i]
-        beta = betas[i]
+        if t > 0:
+            noise = torch.randn_like(x)
+        else:
+            noise = 0
 
-        x = (1 / torch.sqrt(alpha)) * (
-            x - (beta / torch.sqrt(1 - alpha_bar)) * pred_noise
-        )
-
-        if i > 0:
-            x += torch.sqrt(beta) * torch.randn_like(x)
+        x = (1 / torch.sqrt(alpha[t])) * (
+            x - (beta[t] / torch.sqrt(1 - alpha_bar[t])) * noise_pred
+        ) + torch.sqrt(beta[t]) * noise
 
     return x
 
-# =====================
-# 评估
-# =====================
-
+# ===== evaluation =====
 ssim_scores = []
 
-for x, path in loader:
-    x = x.to(device)
+for name in os.listdir(data_dir):
+    path = os.path.join(data_dir, name)
 
-    recon = reconstruct(x)
+    img = Image.open(path)
+    x0 = transform(img).unsqueeze(0).to(device)
 
-    x_img = ((x.clamp(-1,1) + 1) / 2).cpu().numpy()[0,0]
-    recon_img = ((recon.clamp(-1,1) + 1) / 2).cpu().numpy()[0,0]
+    with torch.no_grad():
+        x_rec = reconstruct(x0)
 
-    score = ssim(x_img, recon_img, data_range=1.0)
+    # 反归一化
+    x0_img = (x0 * 0.5 + 0.5).clamp(0,1)
+    x_rec_img = (x_rec * 0.5 + 0.5).clamp(0,1)
+
+    score = ssim(x_rec_img, x0_img, data_range=1.0).item()
     ssim_scores.append(score)
 
-    print(os.path.basename(path[0]), "SSIM:", score)
+    # ===== 保存重建图 =====
+    out = x_rec_img.squeeze().cpu().numpy() * 255
+    out = out.astype(np.uint8)
+
+    save_path = os.path.join(save_dir, name)
+    cv2.imwrite(save_path, out)
+
+    print(f"{name} SSIM={score:.4f}")
 
 print("=================================")
-print("Average SSIM:", np.mean(ssim_scores))
+print("Mean SSIM:", np.mean(ssim_scores))
+print("Saved to:", save_dir)

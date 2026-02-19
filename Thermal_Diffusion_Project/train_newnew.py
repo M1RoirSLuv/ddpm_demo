@@ -13,7 +13,7 @@ from tqdm import tqdm
 # 配置
 # =====================
 
-data_dir = "./ir_256"        # 256×256红外图目录
+data_dir = "./data/raw_256"        # 256×256红外图目录
 save_dir = "./ddpm_ckpt"
 sample_dir = "./ddpm_samples"
 
@@ -99,30 +99,34 @@ class UNet(nn.Module):
             nn.ReLU()
         )
 
+        # encoder
         self.conv0 = nn.Conv2d(1, 64, 3, padding=1)
 
         self.down1 = ResBlock(64, 128, time_dim)
         self.down2 = ResBlock(128, 256, time_dim)
         self.down3 = ResBlock(256, 256, time_dim)
 
+        self.pool = nn.AvgPool2d(2)
+
+        # middle
         self.mid = ResBlock(256, 256, time_dim)
 
+        # decoder（注意输入通道数）
         self.up3 = ResBlock(256 + 256, 256, time_dim)
-        self.up2 = ResBlock(256 + 128, 128, time_dim)
-        self.up1 = ResBlock(128 + 64, 64, time_dim)
+        self.up2 = ResBlock(256 + 256, 128, time_dim)
+        self.up1 = ResBlock(128 + 128, 64, time_dim)
 
         self.out = nn.Conv2d(64, 1, 1)
-        self.pool = nn.AvgPool2d(2)
 
     def forward(self, x, t):
         t = self.time_mlp(t)
 
-        x0 = self.conv0(x)
-        x1 = self.down1(x0, t)
-        x2 = self.down2(self.pool(x1), t)
-        x3 = self.down3(self.pool(x2), t)
+        x0 = self.conv0(x)        # 64
+        x1 = self.down1(x0, t)    # 128
+        x2 = self.down2(self.pool(x1), t)  # 256
+        x3 = self.down3(self.pool(x2), t)  # 256
 
-        h = self.mid(self.pool(x3), t)
+        h = self.mid(self.pool(x3), t)     # 256
 
         h = F.interpolate(h, scale_factor=2)
         h = self.up3(torch.cat([h, x3], dim=1), t)
@@ -134,6 +138,7 @@ class UNet(nn.Module):
         h = self.up1(torch.cat([h, x1], dim=1), t)
 
         return self.out(h)
+
 
 model = UNet().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=lr)

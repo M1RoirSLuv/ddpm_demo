@@ -2,9 +2,11 @@ import os, torch, torch.nn as nn
 from PIL import Image
 from torchvision import transforms
 from diffusers import StableDiffusionPipeline, DDPMScheduler
+from transformers import CLIPTextModel, CLIPTokenizer
 
 # ===== 配置 =====
-model_id = "stabilityai/stable-diffusion-2-1-base"
+ckpt_path = "./model/v1-5-pruned.ckpt"
+clip_path = "./model/clip-vit-large-patch14"
 data_dir = "ir_rgb_256"
 out_dir = "sd21_ir_lora"
 os.makedirs(out_dir, exist_ok=True)
@@ -16,7 +18,16 @@ epochs = 5
 device = "cuda"
 
 # ===== 加载基座 =====
-pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to(device)
+tokenizer = CLIPTokenizer.from_pretrained(clip_path)
+text_encoder = CLIPTextModel.from_pretrained(clip_path)
+
+pipe = StableDiffusionPipeline.from_single_file(
+    ckpt_path,
+    torch_dtype=torch.float16,
+    text_encoder=text_encoder,
+    tokenizer=tokenizer,
+    safety_checker=None
+).to("cuda")
 unet, vae = pipe.unet, pipe.vae
 noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
 

@@ -69,22 +69,38 @@ unet.requires_grad_(False)
 class LoRAConv2d(nn.Module):
     def __init__(self, conv, rank=4):
         super().__init__()
-        self.conv = conv
-        self.down = nn.Conv2d(conv.in_channels, rank, conv.kernel_size, padding=conv.padding, bias=False)
-        self.up = nn.Conv2d(rank, conv.out_channels, 1, bias=False)
-        nn.init.zeros_(self.up.weight) # 初始设为0，保证初始输出不变
+        self.conv = conv # 原有的 Conv2d 层
+        in_c, out_c = conv.in_channels, conv.out_channels
+        k = conv.kernel_size
+        p = conv.padding
         
-    def forward(self, x):
+        # 必须确保新增层与原层在同一个设备和精度上
+        self.down = nn.Conv2d(in_c, rank, k, padding=p, bias=False).to(conv.weight.device, dtype=conv.weight.dtype)
+        self.up = nn.Conv2d(rank, out_c, 1, bias=False).to(conv.weight.device, dtype=conv.weight.dtype)
+        
+        # 初始化：up 支路设为 0，保证训练开始时模型输出与原版一致
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x, *args, **kwargs):
+        # 使用 *args, **kwargs 接收并忽略可能传进来的多余参数（如 timestep）
         return self.conv(x) + self.up(self.down(x))
 
-for name, module in list(unet.named_modules()):
+# 遍历 UNet 替换层
+for name, module in unet.named_modules():
     if isinstance(module, nn.Conv2d):
-        parent = unet
-        parts = name.split(".")
-        for p in parts[:-1]: parent = getattr(parent, p)
-        setattr(parent, parts[-1], LoRAConv2d(module))
+        # 过滤掉一些可能引起歧义的层（可选）
+        if "conv" in name or "proj" in name:
+            parent = unet
+            parts = name.split(".")
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            
+            # 替换为支持多参数输入的 LoRA 层
+            setattr(parent, parts[-1], LoRAConv2d(module))
 
-unet.to(device)
+# 在注入完成后，统一转换一次精度，防止 Half/Float 冲突
+unet.to(device=device, dtype=torch.float16)
+
 # 修复变量名不一致：opt -> optimizer
 optimizer = torch.optim.AdamW([p for p in unet.parameters() if p.requires_grad], lr=lr)
 

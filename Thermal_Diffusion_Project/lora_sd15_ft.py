@@ -1,13 +1,11 @@
-import os
-import torch
-import torch.nn as nn
-import time
+import os, torch, torch.nn as nn
 from PIL import Image
 from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader # 必须导入
 from diffusers import StableDiffusionPipeline, DDPMScheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+import time
 
 # ===== 配置 =====
 ckpt_path = "./model/v1-5-pruned.ckpt"
@@ -22,124 +20,150 @@ lr = 1e-4
 epochs = 5
 device = "cuda"
 
-# ===== 1. 定义 Dataset 和 DataLoader (修复 NameError) =====
-class LocalDataset(Dataset):
-    def __init__(self, data_dir, size):
-        self.paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(('.png', '.jpg'))]
-        self.transform = transforms.Compose([
-            transforms.Resize((size, size)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])
-        ])
-
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, idx):
-        img = Image.open(self.paths[idx]).convert("RGB")
-        return {"pixel_values": self.transform(img)}
-
-dataset = LocalDataset(data_dir, image_size)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-# ===== 2. 加载基座 (修复本地加载与配置报错) =====
+# ===== 加载基座 =====
 tokenizer = CLIPTokenizer.from_pretrained(clip_path, local_files_only=True)
-text_encoder = CLIPTextModel.from_pretrained(clip_path, local_files_only=True).to(device, dtype=torch.float16)
+text_encoder = CLIPTextModel.from_pretrained(clip_path, local_files_only=True).to(device)
 
-print("Loading SD...")
-# 关键：load_safety_checker=False 彻底关闭对 HF 的网络依赖
+print("Loading SD")
 pipe = StableDiffusionPipeline.from_single_file(
     ckpt_path,
     torch_dtype=torch.float16,
     tokenizer=tokenizer,
     text_encoder=text_encoder,
-    load_safety_checker=False,
+    safety_checker=None,
+    requires_safety_checker=False,
     local_files_only=True
 ).to(device)
+print("SD loaded")
 
 unet, vae = pipe.unet, pipe.vae
 noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
 
-# 冻结
+# 冻结原始权重
+for p in unet.parameters():
+    p.requires_grad = False
 vae.requires_grad_(False)
 text_encoder.requires_grad_(False)
-unet.requires_grad_(False)
 
-# ===== 3. LoRA 注入 (保持原逻辑) =====
+# ===== LoRA 注入=====
 class LoRAConv2d(nn.Module):
     def __init__(self, conv, rank=4):
         super().__init__()
         self.conv = conv
-        in_c = conv.in_channels
-        out_c = conv.out_channels
+        in_c, out_c = conv.in_channels, conv.out_channels
         
-        # 无论原卷积是什么，LoRA 分路建议使用 1x1 卷积来避免尺寸变动冲突
-        # 这样可以保证 self.down(x) 的输出尺寸永远和 x 一致
+        # 统一使用 1x1 卷积，避免 stride 导致的尺寸不匹配报错
         self.down = nn.Conv2d(in_c, rank, kernel_size=1, bias=False)
         self.up = nn.Conv2d(rank, out_c, kernel_size=1, bias=False)
-        
-        # 初始化
-        nn.init.normal_(self.down.weight, std=1 / rank)
         nn.init.zeros_(self.up.weight)
         
     def forward(self, x, *args, **kwargs):
-        # 支路计算：Input -> Down(1x1) -> Up(1x1) -> Result
-        # 主路计算：conv(x)
-        lora_out = self.up(self.down(x))
-        return self.conv(x) + lora_out
+        return self.conv(x) + self.up(self.down(x))
 
-# 遍历 UNet 替换层
-for name, module in unet.named_modules():
+for name, module in list(unet.named_modules()):
     if isinstance(module, nn.Conv2d):
-        # 重点：避开 Downsample 和 Upsample 模块中的卷积，
-        # 因为它们通常带有 stride=2，容易引起维度不匹配
+        # 避开降采样和上采样层，防止张量尺寸不匹配
         if "downsample" in name or "upsample" in name:
             continue
-            
         parent = unet
         parts = name.split(".")
         for p in parts[:-1]:
             parent = getattr(parent, p)
-        
-        # 替换层
-        setattr(parent, parts[-1], LoRAConv2d(module, rank=4))
+        setattr(parent, parts[-1], LoRAConv2d(module))
 
-# 转换精度
 unet.to(device, dtype=torch.float16)
-
-# 修复变量名不一致：opt -> optimizer
 optimizer = torch.optim.AdamW([p for p in unet.parameters() if p.requires_grad], lr=lr)
 
-# ===== 4. 训练循环 (修复数据类型冲突) =====
-unet.train()
-for epoch in range(epochs):
-    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    for batch in progress_bar:
-        # 修复：将输入图像转为 float16，否则 vae 会报错
-        pixel_values = batch["pixel_values"].to(device, dtype=torch.float16)
+# ===== 数据 =====
+class ImageDataset(Dataset):
+    def __init__(self, data_dir, size):
+        self.image_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir)]
+        self.transform = transforms.Compose([
+            transforms.Resize((size, size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        ])
+    def __len__(self):
+        return len(self.image_paths)
+    def __getitem__(self, idx):
+        img = Image.open(self.image_paths[idx]).convert("RGB")
+        return {"pixel_values": self.transform(img)}
 
+dataset = ImageDataset(data_dir, image_size)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# 提前准备一个空的文本 embedding，解决 missing 'encoder_hidden_states' 的报错
+empty_text_inputs = tokenizer([""], return_tensors="pt", padding="max_length", max_length=77).to(device)
+with torch.no_grad():
+    empty_text_embeddings = text_encoder(empty_text_inputs.input_ids)[0].to(dtype=torch.float16)
+
+# ===== 训练 =====
+unet.train()
+
+# 强制 VAE 使用 float32 精度，解决 NaN 
+vae.to(device, dtype=torch.float32)
+
+for epoch in range(epochs):
+    epoch_start = time.time()
+    epoch_loss = 0.0
+
+    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", leave=True)
+
+    for step, batch in enumerate(progress_bar):
+        step_start = time.time()
+        bsz = batch["pixel_values"].size(0)
+
+        # 图像数据转入 GPU，使用 float32 喂给 VAE
+        pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
+
+        # ===== 前向 =====
         with torch.no_grad():
+            # 此时 VAE 和 pixel_values 都是 float32，安全编码不会产生 NaN
             latents = vae.encode(pixel_values).latent_dist.sample()
-            latents = latents * vae.config.scaling_factor
+            latents = latents * 0.18215
+            
+        # 编码完成后，降回 float16 给 UNet 使用
+        latents = latents.to(dtype=torch.float16)
 
         noise = torch.randn_like(latents)
-        bsz = latents.shape[0]
-        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=device).long()
+        timesteps = torch.randint(
+            0, noise_scheduler.config.num_train_timesteps,
+            (bsz,), device=device
+        ).long()
 
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
         
-        # 这里的 LoRA 训练通常需要 Text Embedding，即使是空文本
-        # 为了让代码跑通，我们准备一个空 batch 的文本输入
-        inputs = tokenizer([""] * bsz, return_tensors="pt", padding="max_length", max_length=77, truncation=True).to(device)
-        encoder_hidden_states = text_encoder(inputs.input_ids)[0]
+        # 复制空文本向量以匹配 batch_size
+        encoder_hidden_states = empty_text_embeddings.repeat(bsz, 1, 1)
 
+        # 传入 noisy_latents, timesteps AND encoder_hidden_states
         noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-        loss = torch.nn.functional.mse_loss(noise_pred, noise)
 
-        loss.backward()
-        optimizer.step()
+        # 在 float32 下计算 loss 以保稳定
+        loss = torch.nn.functional.mse_loss(noise_pred.float(), noise.float())
+
+        # ===== 反向 =====
         optimizer.zero_grad()
+        loss.backward()
+        # 加入梯度裁剪，双重保险防 NaN
+        torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
+        optimizer.step()
 
-        progress_bar.set_postfix({"loss": loss.item()})
+        # ===== 统计 =====
+        step_time = time.time() - step_start
+        epoch_loss += loss.item()
+
+        progress_bar.set_postfix({
+            "loss": f"{loss.item():.4f}",
+            "step_time": f"{step_time:.2f}s"
+        })
+
+    epoch_time = time.time() - epoch_start
+    print(
+        f"\nEpoch {epoch+1} finished | "
+        f"avg loss = {epoch_loss/len(dataloader):.6f} | "
+        f"time = {epoch_time/60:.2f} min\n"
+    )
 
 torch.save(unet.state_dict(), os.path.join(out_dir, "lora_unet.pt"))
+print("Saved:", os.path.join(out_dir, "lora_unet.pt"))

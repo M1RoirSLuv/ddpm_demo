@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
-
+from diffusers.pipelines.stable_diffusion.convert_from_ckpt import download_from_original_stable_diffusion_ckpt
 from diffusers import StableDiffusionPipeline, DDPMScheduler
 
 # ===== 配置 =====
@@ -22,12 +22,12 @@ epochs = 5
 device = "cuda"
 
 # ===== 加载 SD（无文本条件）=====
-pipe = StableDiffusionPipeline.from_single_file(
-    ckpt_path,
-    torch_dtype=torch.float16,
-    safety_checker=None,
-    requires_safety_checker=False
-).to(device)
+pipe = download_from_original_stable_diffusion_ckpt(
+    checkpoint_path=ckpt_path,
+    from_safetensors=False,
+    device="cuda",
+    extract_ema=True
+)
 
 unet = pipe.unet
 vae = pipe.vae

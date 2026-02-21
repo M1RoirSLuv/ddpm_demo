@@ -13,7 +13,7 @@ from tqdm import tqdm
 # ===== 配置 =====
 ckpt_path = "./model/v1-5-pruned.ckpt"
 clip_path = "./model/clip-vit-large-patch14"
-data_dir = "ir_rgb_256"
+data_dir = "./data/raw_256"
 out_dir = "sd15_ir_lora"
 os.makedirs(out_dir, exist_ok=True)
 

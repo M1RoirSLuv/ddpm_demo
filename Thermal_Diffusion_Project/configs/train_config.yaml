@@ -1,7 +1,7 @@
 experiment_name: "thermal_ddpm_base"
 data:
-  dataset_path: "./data/raw"  # 修改为你存放10K张红外图片的实际路径
-  image_size: 64              # 初学者建议64，显存大可改128
+  dataset_path: "./data/raw"   
+  image_size: 64              
   channels: 1                 # 红外单通道
   sample_limit: 10000         # 限制读取数量
 

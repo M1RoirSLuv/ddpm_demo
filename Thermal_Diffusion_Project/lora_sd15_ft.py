@@ -10,7 +10,7 @@ import time
 ckpt_path = "./model/v1-5-pruned.ckpt"
 clip_path = "./model/clip-vit-large-patch14"
 data_dir = "ir_rgb_256"
-out_dir = "sd21_ir_lora"
+out_dir = "sd15_ir_lora"
 os.makedirs(out_dir, exist_ok=True)
 
 image_size = 256
@@ -20,16 +20,28 @@ epochs = 5
 device = "cuda"
 
 # ===== 加载基座 =====
-tokenizer = CLIPTokenizer.from_pretrained(clip_path)
-text_encoder = CLIPTextModel.from_pretrained(clip_path)
+tokenizer = CLIPTokenizer.from_pretrained(
+    clip_path,
+    local_files_only=True
+)
 
+text_encoder = CLIPTextModel.from_pretrained(
+    clip_path,
+    local_files_only=True
+)
+
+print("Loading SD")
 pipe = StableDiffusionPipeline.from_single_file(
     ckpt_path,
     torch_dtype=torch.float16,
-    text_encoder=text_encoder,
     tokenizer=tokenizer,
-    safety_checker=None
+    text_encoder=text_encoder,
+    safety_checker=None,
+    requires_safety_checker=False,
+    local_files_only=True
 ).to("cuda")
+print("SD loaded")
+
 unet, vae = pipe.unet, pipe.vae
 noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
 

@@ -69,37 +69,43 @@ unet.requires_grad_(False)
 class LoRAConv2d(nn.Module):
     def __init__(self, conv, rank=4):
         super().__init__()
-        self.conv = conv # 原有的 Conv2d 层
-        in_c, out_c = conv.in_channels, conv.out_channels
-        k = conv.kernel_size
-        p = conv.padding
+        self.conv = conv
+        in_c = conv.in_channels
+        out_c = conv.out_channels
         
-        # 必须确保新增层与原层在同一个设备和精度上
-        self.down = nn.Conv2d(in_c, rank, k, padding=p, bias=False).to(conv.weight.device, dtype=conv.weight.dtype)
-        self.up = nn.Conv2d(rank, out_c, 1, bias=False).to(conv.weight.device, dtype=conv.weight.dtype)
+        # 无论原卷积是什么，LoRA 分路建议使用 1x1 卷积来避免尺寸变动冲突
+        # 这样可以保证 self.down(x) 的输出尺寸永远和 x 一致
+        self.down = nn.Conv2d(in_c, rank, kernel_size=1, bias=False)
+        self.up = nn.Conv2d(rank, out_c, kernel_size=1, bias=False)
         
-        # 初始化：up 支路设为 0，保证训练开始时模型输出与原版一致
+        # 初始化
+        nn.init.normal_(self.down.weight, std=1 / rank)
         nn.init.zeros_(self.up.weight)
-
+        
     def forward(self, x, *args, **kwargs):
-        # 使用 *args, **kwargs 接收并忽略可能传进来的多余参数（如 timestep）
-        return self.conv(x) + self.up(self.down(x))
+        # 支路计算：Input -> Down(1x1) -> Up(1x1) -> Result
+        # 主路计算：conv(x)
+        lora_out = self.up(self.down(x))
+        return self.conv(x) + lora_out
 
 # 遍历 UNet 替换层
 for name, module in unet.named_modules():
     if isinstance(module, nn.Conv2d):
-        # 过滤掉一些可能引起歧义的层（可选）
-        if "conv" in name or "proj" in name:
-            parent = unet
-            parts = name.split(".")
-            for p in parts[:-1]:
-                parent = getattr(parent, p)
+        # 重点：避开 Downsample 和 Upsample 模块中的卷积，
+        # 因为它们通常带有 stride=2，容易引起维度不匹配
+        if "downsample" in name or "upsample" in name:
+            continue
             
-            # 替换为支持多参数输入的 LoRA 层
-            setattr(parent, parts[-1], LoRAConv2d(module))
+        parent = unet
+        parts = name.split(".")
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        
+        # 替换层
+        setattr(parent, parts[-1], LoRAConv2d(module, rank=4))
 
-# 在注入完成后，统一转换一次精度，防止 Half/Float 冲突
-unet.to(device=device, dtype=torch.float16)
+# 转换精度
+unet.to(device, dtype=torch.float16)
 
 # 修复变量名不一致：opt -> optimizer
 optimizer = torch.optim.AdamW([p for p in unet.parameters() if p.requires_grad], lr=lr)

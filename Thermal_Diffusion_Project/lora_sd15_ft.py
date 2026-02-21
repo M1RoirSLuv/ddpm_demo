@@ -3,6 +3,8 @@ from PIL import Image
 from torchvision import transforms
 from diffusers import StableDiffusionPipeline, DDPMScheduler
 from transformers import CLIPTextModel, CLIPTokenizer
+from tqdm import tqdm
+import time
 
 # ===== 配置 =====
 ckpt_path = "./model/v1-5-pruned.ckpt"
@@ -71,25 +73,57 @@ dataset = torch.stack(imgs)
 
 # ===== 训练 =====
 unet.train()
-for ep in range(epochs):
-    perm = torch.randperm(len(dataset))
-    dataset = dataset[perm]
-    for i in range(0, len(dataset), batch_size):
-        x = dataset[i:i+batch_size].to(device)
-        with torch.no_grad():
-            z = vae.encode(x).latent_dist.sample() * 0.18215
+for epoch in range(epochs):
 
-        noise = torch.randn_like(z)
-        t = torch.randint(0, noise_scheduler.config.num_train_timesteps,
-                          (z.size(0),), device=device).long()
-        zt = noise_scheduler.add_noise(z, noise, t)
+    epoch_start = time.time()
+    epoch_loss = 0.0
 
-        pred = unet(zt, t, encoder_hidden_states=None).sample
-        loss = (noise - pred).pow(2).mean()
+    progress_bar = tqdm(
+        dataloader,
+        desc=f"Epoch {epoch+1}/{epochs}",
+        leave=True
+    )
 
-        opt.zero_grad(); loss.backward(); opt.step()
+    for step, batch in enumerate(progress_bar):
 
-    print(f"epoch {ep} loss {loss.item():.4f}")
+        step_start = time.time()
+
+        # ===== 前向 =====
+        latents = vae.encode(batch["pixel_values"].to(device)).latent_dist.sample()
+        latents = latents * 0.18215
+
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(
+            0, noise_scheduler.num_train_timesteps,
+            (latents.size(0),), device=device
+        )
+
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        noise_pred = unet(noisy_latents, timesteps).sample
+
+        loss = torch.nn.functional.mse_loss(noise_pred, noise)
+
+        # ===== 反向 =====
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # ===== 统计 =====
+        step_time = time.time() - step_start
+        epoch_loss += loss.item()
+
+        progress_bar.set_postfix({
+            "loss": f"{loss.item():.4f}",
+            "step_time": f"{step_time:.2f}s"
+        })
+
+    epoch_time = time.time() - epoch_start
+
+    print(
+        f"\nEpoch {epoch+1} finished | "
+        f"avg loss = {epoch_loss/len(dataloader):.6f} | "
+        f"time = {epoch_time/60:.2f} min\n"
+    )
 
 torch.save(unet.state_dict(), os.path.join(out_dir, "lora_unet.pt"))
 print("Saved:", os.path.join(out_dir, "lora_unet.pt"))

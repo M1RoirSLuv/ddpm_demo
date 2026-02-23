@@ -10,14 +10,15 @@ from torch.utils.data import Dataset, DataLoader
 # ===== 路径配置  =====
 ckpt_path = "./model/v1-5-pruned.ckpt"
 clip_path = "./model/clip-vit-large-patch14"
-data_dir = "ir_rgb_256"
+data_dir = "./data/raw_5k"
 out_dir = "sd15_ir_lora"
 os.makedirs(out_dir, exist_ok=True)
 
 image_size = 256
 batch_size = 4
-lr = 5e-5 
-epochs = 5
+lr = 2e-5 
+epochs = 8
+best_loss = float("inf")
 device = "cuda"
 
 # ===== 1. 加载基座  =====
@@ -93,6 +94,7 @@ unet.train()
 vae.to(device, dtype=torch.float32) # VAE 依然保持 FP32 防止编码 NaN
 
 for epoch in range(epochs):
+    epoch_loss = 0.0
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
     for batch in progress_bar:
         # 1. 自动混合精度
@@ -120,6 +122,16 @@ for epoch in range(epochs):
         scaler.step(optimizer)
         scaler.update()
 
+        epoch_loss += loss.item()
         progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-torch.save(unet.state_dict(), os.path.join(out_dir, "lora_unet.pt"))
+    avg_epoch_loss = epoch_loss / len(dataloader)
+    print(f"Epoch {epoch+1} 结束，平均 Loss: {avg_epoch_loss:.6f}")
+
+    if avg_epoch_loss < best_loss:
+        best_loss = avg_epoch_loss
+        torch.save(unet.state_dict(), os.path.join(out_dir, "lora_unet_best.pt"))
+        print(f"检测到更低的 Loss，已保存最优模型权重: lora_unet_best.pt")
+
+    torch.save(unet.state_dict(), os.path.join(out_dir, "lora_unet_last.pt"))
+

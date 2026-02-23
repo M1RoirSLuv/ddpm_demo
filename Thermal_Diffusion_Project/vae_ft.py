@@ -50,7 +50,7 @@ optimizer = torch.optim.AdamW(vae.parameters(), lr=lr)
 criterion = torch.nn.MSELoss() # 强制像素级一致
 
 # ===== 训练循环 =====
-print(f"开始微调... 共 {len(self.image_paths)} 张图片")
+print(f"开始微调... 共 {len(dataloader.dataset)} 张图片")
 best_loss = float("inf")
 
 for epoch in range(epochs):

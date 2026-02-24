@@ -4,40 +4,37 @@ from torchvision import transforms
 from diffusers import AutoencoderKL
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
+import lpips  # 新增：感知损失库
 
-# ===== 配置 =====
+# ===== 1. 配置 =====
 ckpt_path = "./model/v1-5-pruned.ckpt"
-data_dir = "./data/raw_5k"      # 使用你的 5k 数据集
-out_dir = "sd15_ir_vae_finetuned"
+data_dir = "./data/raw_5k"
+out_dir = "sd15_ir_vae_lpips"
 os.makedirs(out_dir, exist_ok=True)
 
 image_size = 256
-batch_size = 4
-lr = 5e-6          # VAE 非常脆弱，保持极低学习率
-epochs = 10        # 建议先跑 10 轮观察效果
+batch_size = 2   # 引入 LPIPS 后显存占用增加，建议调小 batch_size
+lr = 5e-6
+epochs = 10
 device = "cuda"
 
-# ===== 加载 VAE  =====
-print(f"正在从 {ckpt_path} 直接加载 VAE...")
-# 必须使用 FP32 训练以保证数值稳定性
-vae = AutoencoderKL.from_single_file(
-    ckpt_path, 
-    torch_dtype=torch.float32
-).to(device)
-
+# ===== 2. 加载模型 =====
+vae = AutoencoderKL.from_single_file(ckpt_path, torch_dtype=torch.float32).to(device)
 vae.requires_grad_(True)
 vae.train()
 
-# ===== 数据准备 =====
+# 新增：初始化 LPIPS 模型 (使用 VGG 作为后端，效果最稳)
+loss_fn_vgg = lpips.LPIPS(net='vgg').to(device) 
+
+# ===== 3. 数据准备 (同之前) =====
 class VAEDataset(Dataset):
     def __init__(self, data_dir, size):
-        # 自动过滤无效文件
         self.image_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) 
                            if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
         self.transform = transforms.Compose([
             transforms.Resize((size, size)),
             transforms.ToTensor(),
-            transforms.Normalize([0.5]*3, [0.5]*3)
+            transforms.Normalize([0.5]*3, [0.5]*3) # LPIPS 默认预期 [-1, 1] 范围
         ])
     def __len__(self): return len(self.image_paths)
     def __getitem__(self, idx):
@@ -45,12 +42,12 @@ class VAEDataset(Dataset):
 
 dataloader = DataLoader(VAEDataset(data_dir, image_size), batch_size=batch_size, shuffle=True)
 
-# ===== 优化器与 Loss =====
+# ===== 4. 优化器 =====
 optimizer = torch.optim.AdamW(vae.parameters(), lr=lr)
-criterion = torch.nn.MSELoss() # 强制像素级一致
+mse_criterion = torch.nn.MSELoss()
 
-# ===== 训练循环 =====
-print(f"开始微调... 共 {len(dataloader.dataset)} 张图片")
+# ===== 5. 训练循环 =====
+print(f"开始 LPIPS 增强训练... 共 {len(dataloader.dataset)} 张图片")
 best_loss = float("inf")
 
 for epoch in range(epochs):
@@ -60,31 +57,35 @@ for epoch in range(epochs):
     for batch in progress_bar:
         img = batch.to(device)
         
-        # 编码并采样潜变量
-        # 0.18215 是 SD 1.5 默认的缩放系数，保持一致
+        # 重建流程
         latents = vae.encode(img).latent_dist.sample()
-        
-        # 解码重建
         reconstruction = vae.decode(latents).sample
         
-        # 计算像素级差异
-        loss = criterion(reconstruction, img)
+        # --- 组合损失函数 ---
+        # 1. MSE Loss (像素级准确性)
+        mse_loss = mse_criterion(reconstruction, img)
+        
+        # 2. LPIPS Loss (感知级清晰度)
+        # lpips 计算结果通常在 0.1-0.5 之间，可以加一个权重系数
+        lpips_loss = loss_fn_vgg(reconstruction, img).mean()
+        
+        # 总损失：1.0 * MSE + 0.1 * LPIPS (这是一个经典的平衡比例)
+        total_loss = mse_loss + 0.1 * lpips_loss
         
         optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         optimizer.step()
         
-        epoch_loss += loss.item()
-        progress_bar.set_postfix({"mse": f"{loss.item():.6f}"})
+        epoch_loss += total_loss.item()
+        progress_bar.set_postfix({
+            "mse": f"{mse_loss.item():.4f}", 
+            "lpips": f"{lpips_loss.item():.4f}"
+        })
 
     avg_loss = epoch_loss / len(dataloader)
-    print(f"Epoch {epoch+1} 平均损失: {avg_loss:.6f}")
-    
-    # 自动保存最优模型 (diffusers 格式)
     if avg_loss < best_loss:
         best_loss = avg_loss
-        save_path = os.path.join(out_dir, "vae_best")
-        vae.save_pretrained(save_path)
-        print(f"--- 性能提升！已保存至 {save_path} ---")
+        vae.save_pretrained(os.path.join(out_dir, "vae_best_lpips"))
+        print(f"--- 性能提升！已保存 ---")
 
-print("VAE 微调任务圆满完成！")
+print("VAE LPIPS 微调完成！")

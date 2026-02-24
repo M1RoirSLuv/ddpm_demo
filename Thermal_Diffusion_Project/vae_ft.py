@@ -23,7 +23,7 @@ vae = AutoencoderKL.from_single_file(ckpt_path, torch_dtype=torch.float32).to(de
 vae.requires_grad_(True)
 vae.train()
 
-# 新增：初始化 LPIPS 模型 (使用 VGG 作为后端，效果最稳)
+# 新增：初始化 LPIPS 模型
 loss_fn_vgg = lpips.LPIPS(net='vgg').to(device) 
 
 # ===== 3. 数据准备 (同之前) =====
